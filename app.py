@@ -3,15 +3,21 @@
 #
 # Aplicación Principal del Dashboard "Reefer-Tech" con Streamlit.
 #
-# v38 (Corrección Crítica de Timezone)
-# - CORREGIDO (CRÍTICO - BATERÍA): Se corrigió el error
-#   `TypeError: Already tz-aware, use tz_convert to convert.`
-#   Los timestamps de /stats/history ya vienen en UTC (con 'Z'),
-#   por lo que se cambió `tz_localize(pytz.utc).tz_convert(...)`
-#   a solo `tz_convert(...)` en `process_vehicle_stats_history`.
-# - MANTENIDO (LÓGICA v37): Se mantiene toda la lógica profesional
-#   de separación de snapshots (KPIs) e historiales (Gráficos),
-#   así como el doble historial (1h/30s y 24h/10min).
+# v39 (Solución Profesional de Webhooks y KPIs)
+# - CORREGIDO (CRÍTICO - WEBHOOKS): Eliminada la dependencia de Flask/Threading.
+#   Se elimina la llamada a `start_webhook_thread`. Se añade
+#   `st.session_state.previous_live_stats` y una nueva función
+#   `check_and_log_alerts` que se ejecuta en cada ciclo y compara
+#   el estado de `checkEngineLightIsOn` para registrar alertas
+#   internamente. Esto soluciona los errores 303 y "Address in use".
+# - CORREGIDO (CRÍTICO - KPIs ATORADOS): Los KPIs de Temperatura, Humedad
+#   y Batería ahora toman su valor principal y timestamp desde el
+#   último punto (`.iloc[-1]`) de su respectivo dataframe de
+#   historial (`df_history_1h` o `df_battery_history_24h`),
+#   asegurando que siempre estén tan actualizados como sus gráficos.
+# - MEJORADO (UI PUERTA): `render_door_status` ahora busca el
+#   último evento *diferente* en el historial de 1h y lo muestra
+#   debajo del ping (ej. "Previo: Abierta a las 07:35:12").
 # --------------------------------------------------------------------------
 
 import streamlit as st
@@ -44,18 +50,21 @@ st.set_page_config(
 
 MEXICO_TZ = pytz.timezone("America/Mexico_City") 
 
-# (v31) Intervalo de refresco de 30 segundos
+# Intervalo de refresco
 REFRESH_INTERVAL_SEC = 30
 
-# --- (v31) INICIALIZACIÓN DE SESSION_STATE ---
+# --- INICIALIZACIÓN DE SESSION_STATE ---
 try:
     if 'api_client' not in st.session_state:
         st.session_state.api_client = utils.SamsaraAPIClient(api_key=utils.SAMSARA_API_KEY)
     if 'ai_model' not in st.session_state:
         st.session_state.ai_model = utils.AIModels()
-    if 'webhook_thread_started' not in st.session_state:
-        utils.start_webhook_thread()
-        st.session_state.webhook_thread_started = True
+    
+    # (v39) Hilo de Webhook ELIMINADO
+    # if 'webhook_thread_started' not in st.session_state:
+    #     utils.start_webhook_thread()
+    #     st.session_state.webhook_thread_started = True
+
 except ValueError as e:
     st.error(f"Error de Configuración: {e}. Revisa tu archivo .env.")
     st.stop()
@@ -73,8 +82,12 @@ if 'sensor_config' not in st.session_state:
 if 'last_webhook_timestamp' not in st.session_state:
     st.session_state.last_webhook_timestamp = None
     
+# (v39) Estado para el nuevo motor de alertas
+if 'previous_live_stats' not in st.session_state:
+    st.session_state.previous_live_stats = None
 
-# --- CSS v35 (Limpieza de UI) ---
+
+# --- CSS v39 (Añadido .door-prev-event) ---
 st.markdown("""
 <style>
     .block-container { 
@@ -145,10 +158,12 @@ st.markdown("""
         font-size: 0.9rem; 
         color: #B0B0B0;
     }
-    
-    /* (v35) Lista de eventos de puerta eliminada */
-    .door-event-list {
-        display: none;
+    /* (v39) Estilo para el evento previo de puerta */
+    .door-prev-event {
+        font-size: 0.8rem;
+        color: #808080;
+        margin-top: 8px;
+        font-style: italic;
     }
     
     .webhook-alert {
@@ -183,6 +198,7 @@ def load_vehicle_list(_api_client):
 
 @st.cache_data(ttl=REFRESH_INTERVAL_SEC)
 def fetch_live_kpis(_api_client, sensor_config, vehicle_id):
+    """(v39) Obtiene Snapshots (KPIs en vivo y estado de fallas)."""
     if not _api_client or not vehicle_id: return None, [], []
     stats_data = _api_client.get_live_stats(vehicle_id)
     temp_data, hum_data = _api_client.get_live_sensor_kpis(sensor_config, vehicle_id)
@@ -200,14 +216,13 @@ def fetch_live_sensor_history(_api_client, sensor_config, window_minutes, step_s
     )
 
 @st.cache_data(ttl=REFRESH_INTERVAL_SEC)
-def fetch_vehicle_stats_history(_api_client, vehicle_id, window_minutes, step_seconds):
+def fetch_vehicle_stats_history(_api_client, vehicle_id, window_minutes):
     """(v37) NUEVA función para obtener historial de Batería, GPS y Fallas."""
     if not _api_client or not vehicle_id:
         return None
     return _api_client.get_vehicle_stats_history(
         vehicle_id,
-        window_minutes,
-        step_seconds
+        window_minutes
     )
 
 @st.cache_data
@@ -285,7 +300,10 @@ def process_vehicle_stats_history(stats_history_data):
                 
                 # --- (v38) CORRECCIÓN CRÍTICA ---
                 # Los timestamps ya son tz-aware (UTC), así que convertimos directamente
-                df_battery = df_battery.tz_convert(MEXICO_TZ)
+                if not df_battery.index.tz:
+                     df_battery = df_battery.tz_localize(pytz.utc).tz_convert(MEXICO_TZ)
+                else:
+                     df_battery = df_battery.tz_convert(MEXICO_TZ)
                 # ---------------------------------
                 
                 # Renombrar columna para que render_mini_chart funcione
@@ -453,27 +471,44 @@ def render_mini_chart(series_data, color):
     st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
 
 def render_door_status(door_series_1h):
-    """(v36) Lógica de estado de puerta 100% basada en el historial de alta frecuencia (door_series_1h)."""
+    """(v39) Añadida lógica para mostrar el último evento *opuesto*."""
     
     if door_series_1h is None or door_series_1h.empty:
         status_str, status_time_str, status_class = "N/A", "Ping: N/A", "door-status-closed"
+        prev_event_str = ""
     else:
-        # Tomar el último valor y timestamp del historial
+        # 1. Obtener estado actual
         latest_status = door_series_1h.iloc[-1]
         latest_time = door_series_1h.index[-1]
         
         status_str = "CERRADA" if latest_status == 1 else "ABIERTA"
         status_class = "door-status-closed" if latest_status == 1 else "door-status-open"
         status_time_str = f"Último Ping: {latest_time.strftime('%H:%M:%S')}"
+        
+        # 2. Buscar último evento opuesto
+        prev_event_str = ""
+        try:
+            # Encontrar todos los eventos *diferentes* al actual
+            different_events = door_series_1h[door_series_1h != latest_status]
+            if not different_events.empty:
+                # Tomar el último de ellos (el más reciente)
+                last_diff_time = different_events.index[-1]
+                last_diff_status_val = different_events.iloc[-1]
+                last_diff_status_str = "CERRADA" if last_diff_status_val == 1 else "ABIERTA"
+                prev_event_str = f"(Previo: {last_diff_status_str} a las {last_diff_time.strftime('%H:%M:%S')})"
+        except Exception as e:
+            print(f"Error al buscar evento previo de puerta: {e}")
+            prev_event_str = "" # Fallback
     
     st.markdown(f"<h5>🚪 Estado de Puerta</h5>", unsafe_allow_html=True)
     
-    # (v36) CORRECCIÓN: HTML limpio sin lista de eventos
+    # (v39) HTML actualizado con .door-prev-event
     st.markdown(f"""
     <div class='door-status-box {status_class}'>
         <div>
             <div class='door-status-text'>{status_str}</div>
             <div class='door-ping-time'>{status_time_str}</div>
+            <div class='door-prev-event'>{prev_event_str}</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -517,6 +552,8 @@ def render_history_charts(df, title_suffix):
     return df
 
 def render_webhook_log():
+    """(v39) Esta función no cambia. Sigue leyendo del archivo,
+    que ahora es poblado por `check_and_log_alerts`."""
     st.subheader("🔔 Últimas Alertas del Activo")
     log_file = utils.WEBHOOK_LOG_FILE
     
@@ -532,7 +569,7 @@ def render_webhook_log():
                 if line.strip():
                     alerts.append(json.loads(line))
     except Exception as e:
-        st.error(f"Error al leer el registro de webhooks: {e}")
+        st.error(f"Error al leer el registro de alertas: {e}")
         return
         
     alerts.reverse()
@@ -588,6 +625,39 @@ def get_ia_prediction(_ai_model, temperature_series, step_sec_ai):
         )
     return None, []
 
+# --- (v39) NUEVO MOTOR DE ALERTAS (Reemplaza Webhooks) ---
+def check_and_log_alerts(current_stats, previous_stats, vehicle_name):
+    """Compara el estado actual con el previo y registra alertas."""
+    if not previous_stats or not current_stats:
+        print("Motor de Alertas: Esperando al siguiente ciclo (no hay datos previos).")
+        return # No alertar en la primera ejecución
+
+    current_time_str = datetime.now(MEXICO_TZ).strftime('%Y-%m-%d %H:%M:%S')
+
+    # 1. Alerta de Check Engine Light
+    try:
+        current_cel = current_stats.get('faultCodes', {}).get('obdii', {}).get('checkEngineLightIsOn', False)
+        prev_cel = previous_stats.get('faultCodes', {}).get('obdii', {}).get('checkEngineLightIsOn', False)
+        
+        if current_cel and not prev_cel:
+            alert_info = {
+                "type": "Alerta de Motor",
+                "driver_name": "N/A",
+                "vehicle_name": vehicle_name,
+                "message": "Luz de Check Engine (MIL) se ha ENCENDIDO.",
+                "timestamp": current_time_str
+            }
+            utils.log_alert(alert_info)
+            print("ALERTA GENERADA: Check Engine Light ON")
+            
+    except Exception as e:
+        print(f"Error al procesar alerta de Check Engine: {e}")
+
+    # (Futuro) Aquí se pueden añadir más comprobaciones:
+    # Ej. if current_temp > 50 and prev_temp <= 50: ...
+    # Ej. if current_door == 'ABIERTA' for > 10 min: ...
+
+
 # --- 5. INICIALIZACIÓN DE LA APP ---
 
 vehicle_names, vehicle_map_obj = load_vehicle_list(st.session_state.api_client)
@@ -608,6 +678,9 @@ def on_vehicle_change():
         st.session_state.sensor_config = None
     # Limpiar caché de datos
     st.cache_data.clear()
+    # (v39) Reiniciar el estado de alertas
+    st.session_state.previous_live_stats = None
+
 
 if st.session_state.selected_vehicle_name is None and vehicle_names:
     st.session_state.selected_vehicle_name = vehicle_names[0]
@@ -627,10 +700,11 @@ if not st.session_state.selected_vehicle_obj:
 
 # --- 7. CARGA DE DATOS PRINCIPAL (CACHEADA) ---
 selected_vehicle_id = st.session_state.selected_vehicle_obj['id']
+selected_vehicle_name = st.session_state.selected_vehicle_obj['name']
 sensor_config = st.session_state.sensor_config
 
 # 1. SNAPSHOT (Último valor de KPIs y GPS)
-live_stats, live_temp, live_hum = fetch_live_kpis(
+live_stats, live_temp_snapshot, live_hum_snapshot = fetch_live_kpis(
     st.session_state.api_client, sensor_config, selected_vehicle_id
 )
 live_fault_codes_obj = live_stats.get('faultCodes') if live_stats else None
@@ -654,9 +728,13 @@ df_history_24h = process_sensor_history_data(
 
 # 4. (v37) HISTORIAL DE VEHÍCULO (24h, 10min) -> Para Gráfico de Batería y Lista de Fallas
 raw_stats_history = fetch_vehicle_stats_history(
-    st.session_state.api_client, selected_vehicle_id, 1440, 600
+    st.session_state.api_client, selected_vehicle_id, 1440
 )
 df_battery_history_24h, all_fault_codes_list = process_vehicle_stats_history(raw_stats_history)
+
+# --- (v39) EJECUTAR MOTOR DE ALERTAS ---
+check_and_log_alerts(live_stats, st.session_state.previous_live_stats, selected_vehicle_name)
+st.session_state.previous_live_stats = live_stats # Guardar estado actual para el próximo ciclo
 
 
 # --- 8. RENDERIZADO DE LA BARRA LATERAL ---
@@ -676,13 +754,13 @@ with kpi_col1:
 
 with kpi_col2:
     with st.container(border=True, height=185):
-        temp_val_str, temp_time_str = "N/A", ""
-        if live_temp:
-            temp_sensor_data = live_temp[0] 
-            val = temp_sensor_data.get('probeTemperature', temp_sensor_data.get('ambientTemperature'))
-            if val is not None: temp_val_str = f"{val / 1000.0:.1f} °C"
-            time_str = temp_sensor_data.get('probeTemperatureTime', temp_sensor_data.get('ambientTemperatureTime'))
-            if time_str: temp_time_str = pd.to_datetime(time_str).tz_convert(MEXICO_TZ).strftime('(%H:%M)')
+        # (v39) KPI de Temperatura basado en el historial de 1h
+        temp_val_str, temp_time_str = "N/A", "(N/A)"
+        if not df_history_1h.empty and 'temperature' in df_history_1h.columns:
+            latest_temp = df_history_1h['temperature'].iloc[-1]
+            latest_temp_time = df_history_1h.index[-1]
+            temp_val_str = f"{latest_temp:.1f} °C"
+            temp_time_str = latest_temp_time.strftime('(%H:%M)')
         
         st.metric(label=f"🌡️ Temperatura {temp_time_str}", value=temp_val_str)
         
@@ -694,13 +772,13 @@ with kpi_col2:
 
 with kpi_col3:
     with st.container(border=True, height=185):
-        hum_val_str, hum_time_str = "N/A", ""
-        if live_hum:
-            hum_sensor_data = live_hum[0]
-            val = hum_sensor_data.get('humidity')
-            if val is not None: hum_val_str = f"{val:.0f} %"
-            time_str = hum_sensor_data.get('humidityTime')
-            if time_str: hum_time_str = pd.to_datetime(time_str).tz_convert(MEXICO_TZ).strftime('(%H:%M)')
+        # (v39) KPI de Humedad basado en el historial de 1h
+        hum_val_str, hum_time_str = "N/A", "(N/A)"
+        if not df_history_1h.empty and 'humidity' in df_history_1h.columns:
+            latest_hum = df_history_1h['humidity'].iloc[-1]
+            latest_hum_time = df_history_1h.index[-1]
+            hum_val_str = f"{latest_hum:.0f} %"
+            hum_time_str = latest_hum_time.strftime('(%H:%M)')
         
         st.metric(label=f"💧 Humedad {hum_time_str}", value=hum_val_str)
 
@@ -712,13 +790,13 @@ with kpi_col3:
             
 with kpi_col4:
     with st.container(border=True, height=185):
-        bat_val, bat_time_str = "N/A", ""
-        if live_stats and live_stats.get('batteryMilliVolts'):
-            bat = live_stats['batteryMilliVolts']
-            val = bat.get('value')
-            if val is not None: bat_val = f"{val / 1000.0:.2f} V"
-            time_str = bat.get('time')
-            if time_str: bat_time_str = pd.to_datetime(time_str).tz_convert(MEXICO_TZ).strftime('(%H:%M)')
+        # (v39) KPI de Batería basado en el historial de 24h
+        bat_val, bat_time_str = "N/A", "(N/A)"
+        if not df_battery_history_24h.empty and 'value' in df_battery_history_24h.columns:
+            latest_bat = df_battery_history_24h['value'].iloc[-1]
+            latest_bat_time = df_battery_history_24h.index[-1]
+            bat_val = f"{latest_bat:.2f} V"
+            bat_time_str = latest_bat_time.strftime('(%H:%M)')
         
         st.metric(label=f"🔋 Batería {bat_time_str}", value=bat_val)
 
@@ -737,7 +815,7 @@ with col1:
     # --- MAPA (Usa Snapshot) ---
     st.subheader("📍 Ubicación en Tiempo Real")
     
-    map_center, popup_html = generate_map_data(live_stats, st.session_state.selected_vehicle_name)
+    map_center, popup_html = generate_map_data(live_stats, selected_vehicle_name)
 
     m = folium.Map(location=map_center, zoom_start=14, tiles="CartoDB dark_matter")
     if popup_html != "No hay datos de GPS.":
@@ -754,7 +832,7 @@ with col1:
     
     st_folium(m, width=None, height=500, use_container_width=True, returned_objects=[])
     
-    # --- LOG DE WEBHOOKS ---
+    # --- LOG DE WEBHOOKS (AHORA POBLADO POR EL MOTOR DE ALERTAS) ---
     st.markdown("---")
     render_webhook_log() 
 
