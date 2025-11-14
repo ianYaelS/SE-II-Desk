@@ -10,6 +10,10 @@
 #   para obtener los incidentes reales (reemplaza 'log_alert').
 # - ELIMINADO: Eliminada la función 'log_alert'.
 # - ELIMINADO: Eliminada la constante 'WEBHOOK_LOG_FILE'.
+#
+# (v43) No se requieren cambios en utils.py.
+# La función 'get_vehicle_stats_history' ya es capaz de
+# manejar diferentes 'window_minutes' (60 min y 1440 min).
 # --------------------------------------------------------------------------
 
 import requests
@@ -40,7 +44,6 @@ if not SAMSARA_API_KEY:
 SAMSARA_API_URL = "https://api.samsara.com"
 MEXICO_TZ = pytz.timezone("America/Mexico_City") 
 # (v42) Eliminado WEBHOOK_LOG_FILE
-# WEBHOOK_LOG_FILE = "webhook_log.jsonl"
 
 
 # --- 2. CLIENTE DE LA API DE SAMSARA ---
@@ -378,7 +381,3 @@ class AIModels:
         except Exception as e:
             print(f"Error durante la predicción LSTM: {e}")
             return None, []
-
-# --- (v42) REGISTRADOR DE ALERTAS INTERNO ELIMINADO ---
-# def log_alert(alert_info):
-#     ...
