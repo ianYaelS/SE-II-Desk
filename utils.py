@@ -3,17 +3,13 @@
 #
 # Lógica de Backend, Cliente de API de Samsara e IA.
 #
-# v39 (Solución Profesional de Webhooks)
-# - ELIMINADO (CRÍTICO): Se eliminó TODO el código relacionado con
-#   Flask, threading, hmac, hashlib. Las funciones `run_flask_app`,
-#   `start_webhook_thread` y `handle_samsara_webhook` han sido
-#   borradas. Esto soluciona los errores 303 y "Address in use"
-#   en Streamlit Cloud.
-# - NUEVO: Se añadió una función simple `log_alert(alert_info)`
-#   que simplemente escribe en el archivo `webhook_log.jsonl`.
-#   Esta función es llamada por el nuevo motor de alertas en `app.py`.
-# - MANTENIDO (v37): Se mantiene la función `get_vehicle_stats_history`
-#   para obtener el historial de batería y fallas.
+# v42 (Alertas Reales de API)
+# - NUEVO: Añadida la función 'get_alert_configurations' al cliente API
+#   para obtener todas las configuraciones de alertas.
+# - NUEVO: Añadida la función 'get_alert_incidents' al cliente API
+#   para obtener los incidentes reales (reemplaza 'log_alert').
+# - ELIMINADO: Eliminada la función 'log_alert'.
+# - ELIMINADO: Eliminada la constante 'WEBHOOK_LOG_FILE'.
 # --------------------------------------------------------------------------
 
 import requests
@@ -36,19 +32,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 SAMSARA_API_KEY = os.getenv("SAMSARA_API_KEY")
-SAMSARA_WEBHOOK_SECRET = os.getenv("SAMSARA_WEBHOOK_SECRET") # (v39) Ya no se usa para hmac, pero se mantiene por si acaso
+SAMSARA_WEBHOOK_SECRET = os.getenv("SAMSARA_WEBHOOK_SECRET") # (v39) Ya no se usa para hmac
 
 if not SAMSARA_API_KEY:
     raise ValueError("La variable SAMSARA_API_KEY no está configurada en el archivo .env")
-# (v39) El secret ya no es crítico para el funcionamiento
-# if not SAMSARA_WEBHOOK_SECRET:
-#     raise ValueError("La variable SAMSARA_WEBHOOK_SECRET no está configurada en el archivo .env")
 
 SAMSARA_API_URL = "https://api.samsara.com"
 MEXICO_TZ = pytz.timezone("America/Mexico_City") 
-WEBHOOK_LOG_FILE = "webhook_log.jsonl"
-# (v39) Puerto de Webhook eliminado
-# WEBHOOK_PORT = 5001
+# (v42) Eliminado WEBHOOK_LOG_FILE
+# WEBHOOK_LOG_FILE = "webhook_log.jsonl"
+
 
 # --- 2. CLIENTE DE LA API DE SAMSARA ---
 
@@ -277,6 +270,29 @@ class SamsaraAPIClient:
         print("API-HIST-VEHICULO: No se encontraron datos históricos de estadísticas.")
         return None
 
+    # --- (v42) NUEVOS ENDPOINTS DE ALERTAS ---
+
+    def get_alert_configurations(self):
+        """(v42) Obtiene todas las configuraciones de alertas de la organización."""
+        print("API: Obteniendo configuraciones de alertas...")
+        endpoint = "/alerts/configurations"
+        return self._make_request(endpoint, method="GET")
+
+    def get_alert_incidents(self, configuration_ids, start_time_iso):
+        """(v42) Obtiene incidentes de alerta para IDs y ventana de tiempo."""
+        if not configuration_ids:
+            print("API: No se proporcionaron IDs de configuración de alertas, saltando la llamada.")
+            return {'data': []} # Devolver una respuesta vacía válida
+            
+        print(f"API: Obteniendo incidentes de alerta para {len(configuration_ids)} IDs...")
+        endpoint = "/alerts/incidents"
+        params = {
+            'startTime': start_time_iso,
+            'configurationIds': ','.join(configuration_ids) # La API espera una lista separada por comas
+        }
+        return self._make_request(endpoint, method="GET", params=params)
+
+
 # --- 3. MODELOS DE INTELIGENCIA ARTIFICIAL (IA) ---
 
 class LSTMForecaster(nn.Module):
@@ -363,18 +379,6 @@ class AIModels:
             print(f"Error durante la predicción LSTM: {e}")
             return None, []
 
-# --- 4. (v39) NUEVO REGISTRADOR DE ALERTAS ---
-
-def log_alert(alert_info):
-    """
-    (v39) Reemplaza la lógica del webhook. Simplemente escribe
-    una alerta generada internamente en el archivo de registro.
-    """
-    try:
-        with open(WEBHOOK_LOG_FILE, "a") as f: # 'a' = append
-            f.write(json.dumps(alert_info) + "\n") # Escribir como JSON Line
-        print(f"Alerta Interna Registrada: {alert_info['message']}")
-    except Exception as e:
-        print(f"Error al escribir en el archivo de registro de alertas: {e}")
-
-# --- (v39) Lógica de Flask/Threading ELIMINADA ---
+# --- (v42) REGISTRADOR DE ALERTAS INTERNO ELIMINADO ---
+# def log_alert(alert_info):
+#     ...
