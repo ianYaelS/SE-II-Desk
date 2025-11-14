@@ -3,20 +3,21 @@
 #
 # Lógica de Backend, Cliente de API de Samsara e IA.
 #
-# v42 (Alertas Reales de API)
-# - NUEVO: Añadida la función 'get_alert_configurations' al cliente API
-#   para obtener todas las configuraciones de alertas.
-# - NUEVO: Añadida la función 'get_alert_incidents' al cliente API
-#   para obtener los incidentes reales (reemplaza 'log_alert').
-# - ELIMINADO: Eliminada la función 'log_alert'.
-# - ELIMINADO: Eliminada la constante 'WEBHOOK_LOG_FILE'.
-#
-# (v43) No se requieren cambios en utils.py.
-# La función 'get_vehicle_stats_history' ya es capaz de
-# manejar diferentes 'window_minutes' (60 min y 1440 min).
+# v44 (Optimización Full-Stack)
+# - OPTIMIZACIÓN: Se elimina la importación de 'time' y 'json' (no usados).
+# - OPTIMIZACIÓN: Se importa 'requests.adapters.HTTPAdapter' y 
+#   'urllib3.util.retry.Retry'.
+# - OPTIMIZACIÓN (API Client):
+#   1. Se utiliza 'requests.Session()' para persistencia de conexión.
+#   2. Se implementa una estrategia de reintentos (3 reintentos) con 
+#      'backoff_factor=1' para errores 429, 500, 502, 503, 504.
+#   3. '_make_request' se actualiza para usar 'self.session.request'
+#      en lugar de 'requests.get/post'.
 # --------------------------------------------------------------------------
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import pandas as pd
 import numpy as np
 import torch
@@ -24,29 +25,23 @@ import torch.nn as nn
 from sklearn.preprocessing import MinMaxScaler
 from scipy.stats import zscore
 import os
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import pytz
-import json
 from dotenv import load_dotenv
-
-# (v39) Imports de Flask/threading eliminados
 
 # --- 1. CONFIGURACIÓN INICIAL Y VARIABLES DE ENTORNO ---
 
 load_dotenv()
 SAMSARA_API_KEY = os.getenv("SAMSARA_API_KEY")
-SAMSARA_WEBHOOK_SECRET = os.getenv("SAMSARA_WEBHOOK_SECRET") # (v39) Ya no se usa para hmac
 
 if not SAMSARA_API_KEY:
     raise ValueError("La variable SAMSARA_API_KEY no está configurada en el archivo .env")
 
 SAMSARA_API_URL = "https://api.samsara.com"
 MEXICO_TZ = pytz.timezone("America/Mexico_City") 
-# (v42) Eliminado WEBHOOK_LOG_FILE
 
 
-# --- 2. CLIENTE DE LA API DE SAMSARA ---
+# --- 2. CLIENTE DE LA API DE SAMSARA (CON REINTENTOS) ---
 
 class SamsaraAPIClient:
     def __init__(self, api_key):
@@ -62,23 +57,42 @@ class SamsaraAPIClient:
             "Accept": "application/json",
             "X-Api-Key": self.api_key
         }
-        print(f"Cliente de API inicializado.")
+        
+        # (v44) Configuración de Sesión y Reintentos
+        self.session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1, # Tiempo de espera = {backoff_factor} * (2 ** ({number_of_retries} - 1))
+            status_forcelist=[429, 500, 502, 503, 504], # Errores en los que reintentar
+            allowed_methods=["HEAD", "GET", "POST"] # Métodos en los que reintentar
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        
+        print(f"Cliente de API inicializado con reintentos (3x).")
 
     def _make_request(self, endpoint, method="GET", params=None, json_data=None, is_v1=False):
-        """Helper function to make API requests with error handling."""
+        """Helper function to make API requests with error handling and retries."""
         url = f"{SAMSARA_API_URL}{endpoint}"
-        headers = self.v1_headers if is_v1 else self.headers
+        headers_to_use = self.v1_headers if is_v1 else self.headers
+        
         try:
-            if method == "GET":
-                response = requests.get(url, headers=headers, params=params)
-            elif method == "POST":
-                response = requests.post(url, headers=headers, params=params, json=json_data)
-            response.raise_for_status()
+            response = self.session.request(
+                method=method.upper(),
+                url=url,
+                headers=headers_to_use,
+                params=params,
+                json=json_data,
+                timeout=10 # 10 segundos de timeout
+            )
+            response.raise_for_status() # Lanza un error para códigos 4xx/5xx
             return response.json()
+        
         except requests.exceptions.HTTPError as http_err:
-            print(f"Error HTTP: {http_err} - {response.text}")
+            print(f"Error HTTP (después de reintentos): {http_err} - {http_err.response.text}")
         except requests.exceptions.RequestException as req_err:
-            print(f"Error de Petición: {req_err}")
+            print(f"Error de Petición (después de reintentos): {req_err}")
         except Exception as e:
             print(f"Error inesperado en la petición de API: {e}")
         return None
@@ -106,7 +120,6 @@ class SamsaraAPIClient:
         }
         data = self._make_request(endpoint, method="GET", params=params)
         if data and 'data' in data and len(data['data']) > 0:
-            # Devuelve el objeto de estadísticas completo
             return data['data'][0]
         print(f"API-LIVE: No se encontraron estadísticas para el vehículo {vehicle_id}.")
         return None
@@ -155,7 +168,6 @@ class SamsaraAPIClient:
         filtered_hum = filter_sensors(hum_data, str(vehicle_id))
 
         print(f"API-LIVE: Datos de KPI recibidos para {vehicle_id}: {len(filtered_temp)} T, {len(filtered_hum)} H.")
-        # (v34) Devuelve solo temp y humedad
         return filtered_temp, filtered_hum
 
     def build_sensor_payload_from_config(self, sensor_configuration):
@@ -237,7 +249,7 @@ class SamsaraAPIClient:
             "startMs": int(start_time_utc.timestamp() * 1000), 
             "stepMs": int(step_ms),
             "series": series_query,
-            "fillMissing": "withNull" # (v34) Cambiado a withNull, ffill se hace en pandas
+            "fillMissing": "withNull"
         }
         
         data = self._make_request("/v1/sensors/history", method="POST", json_data=json_payload, is_v1=True)
@@ -273,7 +285,7 @@ class SamsaraAPIClient:
         print("API-HIST-VEHICULO: No se encontraron datos históricos de estadísticas.")
         return None
 
-    # --- (v42) NUEVOS ENDPOINTS DE ALERTAS ---
+    # --- (v42) ENDPOINTS DE ALERTAS ---
 
     def get_alert_configurations(self):
         """(v42) Obtiene todas las configuraciones de alertas de la organización."""
@@ -291,7 +303,7 @@ class SamsaraAPIClient:
         endpoint = "/alerts/incidents"
         params = {
             'startTime': start_time_iso,
-            'configurationIds': ','.join(configuration_ids) # La API espera una lista separada por comas
+            'configurationIds': ','.join(configuration_ids)
         }
         return self._make_request(endpoint, method="GET", params=params)
 
@@ -328,7 +340,6 @@ class AIModels:
         return df
 
     def get_temperature_forecast(self, data_series, steps_ahead=12, step_seconds=30):
-        """(v29) step_seconds permite predicción correcta para 1h (30s) o 24h (600s)."""
         print("IA: Generando predicción LSTM...")
         if len(data_series) < 5:
             print("IA: No hay suficientes datos para predecir.")
