@@ -3,20 +3,22 @@
 #
 # Aplicación Principal del Dashboard "Reefer-Tech" con Streamlit.
 #
-# v42 (Alertas Reales de API)
-# - ELIMINADO (CRÍTICO - ALERTAS): Eliminada toda la lógica de
-#   "simulación de webhooks" (check_and_log_alerts, previous_live_stats).
-#   Ya no escribimos en 'webhook_log.jsonl'.
-# - NUEVO (LÓGICA DE ALERTAS API):
-#   1. Se añade 'load_alert_configurations' para cachear todas las
-#      configuraciones de alertas de la organización.
-#   2. Se añade 'get_vehicle_config_ids' para filtrar "inteligentemente"
-#      las configuraciones que aplican al 'selected_vehicle_id'.
-#   3. Se añade 'fetch_alert_incidents' para pedir (cada 30s) los
-#      incidentes reales de las últimas 24h para ese vehículo.
-# - MEJORADO (UI ALERTAS): 'render_webhook_log' se renombra a
-#   'render_alert_log' y ahora parsea la respuesta de la API
-#   de '/alerts/incidents', mostrando las alertas reales de Samsara.
+# v43 (KPI de Batería de Alta Frecuencia)
+# - CORREGIDO (CRÍTICO - KPI BATERÍA): El KPI de Batería (v41) usaba
+#   'live_stats', causando un timestamp "atorado" (ej. 08:57)
+#   mientras los sensores mostraban (ej. 09:03).
+# - NUEVO (LÓGICA KPI BATERÍA v43):
+#   1. Se añade una nueva carga de datos: 'fetch_vehicle_stats_history'
+#      ahora se llama para obtener un historial de 1 HORA de alta
+#      frecuencia ('df_battery_history_1h').
+#   2. El KPI de Batería (valor, hora Y mini-gráfico) ahora se
+#      alimenta de 'df_battery_history_1h.iloc[-1]'.
+#   3. Esto alinea la lógica del KPI de Batería con la de Temp/Hum,
+#      haciendo que toda la fila de KPIs se base en un historial
+#      "en vivo" de 1 hora.
+# - MANTENIDO: El 'live_stats' (Snapshot) se sigue usando para
+#   el Mapa (GPS) y el estado del Check Engine Light.
+# - MANTENIDO: La lógica de Alertas API (v42) sigue intacta.
 # --------------------------------------------------------------------------
 
 import streamlit as st
@@ -29,9 +31,6 @@ from folium.features import DivIcon # <-- Ícono de pulso
 from streamlit_folium import st_folium
 import pytz
 from datetime import datetime, timedelta
-# (v42) json y os ya no son necesarios aquí
-# import json
-# import os
 
 # Importar nuestras utilidades de backend (API, IA, Webhook)
 import utils
@@ -77,11 +76,6 @@ if 'sensor_config' not in st.session_state:
 if 'last_webhook_timestamp' not in st.session_state:
     st.session_state.last_webhook_timestamp = None # (v42) Se mantiene para el efecto "Nueva Alerta"
     
-# (v42) Eliminado 'previous_live_stats'
-# if 'previous_live_stats' not in st.session_state:
-#     st.session_state.previous_live_stats = None
-
-
 # --- CSS v39 (Añadido .door-prev-event) ---
 st.markdown("""
 <style>
@@ -193,11 +187,13 @@ def load_vehicle_list(_api_client):
 
 @st.cache_data(ttl=REFRESH_INTERVAL_SEC)
 def fetch_live_kpis(_api_client, sensor_config, vehicle_id):
-    """(v39) Obtiene Snapshots (KPIs en vivo y estado de fallas)."""
-    if not _api_client or not vehicle_id: return None, [], []
+    """(v43) Esta función ahora solo obtiene el Snapshot
+    para el Mapa (GPS) y el Check Engine Light (Faults)."""
+    if not _api_client or not vehicle_id: return None
     stats_data = _api_client.get_live_stats(vehicle_id)
-    temp_data, hum_data = _api_client.get_live_sensor_kpis(sensor_config, vehicle_id)
-    return stats_data, temp_data, hum_data
+    # (v43) Los snapshots de Temp/Hum ya no son necesarios
+    # temp_data, hum_data = _api_client.get_live_sensor_kpis(sensor_config, vehicle_id)
+    return stats_data
 
 @st.cache_data(ttl=REFRESH_INTERVAL_SEC) 
 def fetch_live_sensor_history(_api_client, sensor_config, window_minutes, step_seconds):
@@ -212,7 +208,7 @@ def fetch_live_sensor_history(_api_client, sensor_config, window_minutes, step_s
 
 @st.cache_data(ttl=REFRESH_INTERVAL_SEC)
 def fetch_vehicle_stats_history(_api_client, vehicle_id, window_minutes):
-    """(v37) NUEVA función para obtener historial de Batería, GPS y Fallas."""
+    """(v37) Esta función es para Batería, GPS y Fallas."""
     if not _api_client or not vehicle_id:
         return None
     return _api_client.get_vehicle_stats_history(
@@ -222,7 +218,7 @@ def fetch_vehicle_stats_history(_api_client, vehicle_id, window_minutes):
 
 @st.cache_data
 def process_sensor_history_data(results, column_map, step_seconds=30):
-    """(v37) Renombrada para claridad. Procesa /sensors/history."""
+    """(v37) Procesa /sensors/history."""
     if not results or not column_map:
         return pd.DataFrame() 
 
@@ -271,7 +267,7 @@ def process_sensor_history_data(results, column_map, step_seconds=30):
 
 @st.cache_data
 def process_vehicle_stats_history(stats_history_data):
-    """(v37) NUEVA función para procesar la respuesta de /stats/history."""
+    """(v37) Procesa la respuesta de /stats/history (Batería y Fallas)."""
     df_battery = pd.DataFrame()
     all_faults_list = []
 
@@ -660,11 +656,6 @@ def get_ia_prediction(_ai_model, temperature_series, step_sec_ai):
         )
     return None, []
 
-# --- (v42) MOTOR DE ALERTAS INTERNAS ELIMINADO ---
-# def check_and_log_alerts(current_stats, previous_stats, vehicle_name):
-#     ...
-
-
 # --- 5. INICIALIZACIÓN DE LA APP ---
 
 vehicle_names, vehicle_map_obj = load_vehicle_list(st.session_state.api_client)
@@ -685,8 +676,6 @@ def on_vehicle_change():
         st.session_state.sensor_config = None
     # Limpiar caché de datos
     st.cache_data.clear()
-    # (v42) Eliminado 'previous_live_stats'
-    # st.session_state.previous_live_stats = None
 
 
 if st.session_state.selected_vehicle_name is None and vehicle_names:
@@ -710,8 +699,8 @@ selected_vehicle_id = st.session_state.selected_vehicle_obj['id']
 selected_vehicle_name = st.session_state.selected_vehicle_obj['name']
 sensor_config = st.session_state.sensor_config
 
-# 1. SNAPSHOT (Último valor de KPIs y GPS)
-live_stats, live_temp_snapshot, live_hum_snapshot = fetch_live_kpis(
+# 1. SNAPSHOT (Para Mapa y Check Engine)
+live_stats = fetch_live_kpis(
     st.session_state.api_client, sensor_config, selected_vehicle_id
 )
 live_fault_codes_obj = live_stats.get('faultCodes') if live_stats else None
@@ -725,6 +714,13 @@ df_history_1h = process_sensor_history_data(
     history_results_1h, column_map_1h, step_seconds=30
 )
 
+# 2.5. (v43) HISTORIAL DE VEHÍCULO (1h) -> Para KPI de Batería EN VIVO
+raw_stats_history_1h = fetch_vehicle_stats_history(
+    st.session_state.api_client, selected_vehicle_id, 60 # 60 minutos
+)
+df_battery_history_1h, _ = process_vehicle_stats_history(raw_stats_history_1h)
+
+
 # 3. HISTORIAL DE SENSORES (24h, 10min) -> Para Gráficos de Tendencia
 history_results_24h, column_map_24h = fetch_live_sensor_history(
     st.session_state.api_client, sensor_config, 1440, 600
@@ -733,11 +729,11 @@ df_history_24h = process_sensor_history_data(
     history_results_24h, column_map_24h, step_seconds=600
 )
 
-# 4. (v37) HISTORIAL DE VEHÍCULO (24h, 10min) -> Para Gráfico de Batería y Lista de Fallas
-raw_stats_history = fetch_vehicle_stats_history(
-    st.session_state.api_client, selected_vehicle_id, 1440
+# 4. (v37) HISTORIAL DE VEHÍCULO (24h) -> Para Gráfico de Batería y Lista de Fallas
+raw_stats_history_24h = fetch_vehicle_stats_history(
+    st.session_state.api_client, selected_vehicle_id, 1440 # 1440 minutos = 24h
 )
-df_battery_history_24h, all_fault_codes_list = process_vehicle_stats_history(raw_stats_history)
+df_battery_history_24h, all_fault_codes_list = process_vehicle_stats_history(raw_stats_history_24h)
 
 # 5. (v42) NUEVA CARGA DE ALERTAS REALES
 # 5.1 Cargar todas las configuraciones (cacheado)
@@ -755,11 +751,6 @@ alert_incidents = fetch_alert_incidents(
     vehicle_config_ids, 
     start_time_alerts.isoformat()
 )
-
-
-# --- (v42) MOTOR DE ALERTAS INTERNAS ELIMINADO ---
-# check_and_log_alerts(...)
-
 
 # --- 8. RENDERIZADO DE LA BARRA LATERAL ---
 render_vehicle_info_and_sensors(st.session_state.selected_vehicle_obj, sensor_config)
@@ -814,26 +805,25 @@ with kpi_col3:
             
 with kpi_col4:
     with st.container(border=True, height=185):
-        # (v41) Solución Híbrida para KPI de Batería
+        # (v43) Solución de KPI de Batería con historial de 1h
         bat_val, bat_time_str = "N/A", "(N/A)"
-        if live_stats and live_stats.get('batteryMilliVolts'):
+        if not df_battery_history_1h.empty and 'value' in df_battery_history_1h.columns:
             try:
-                latest_bat_mv = live_stats['batteryMilliVolts']
-                bat_val = f"{float(latest_bat_mv['value']) / 1000.0:.2f} V"
-                # El timestamp ya es tz-aware (UTC), convertir a local
-                bat_time = pd.to_datetime(latest_bat_mv['time']).tz_convert(MEXICO_TZ)
-                bat_time_str = bat_time.strftime('(%H:%M)')
+                latest_bat = df_battery_history_1h['value'].iloc[-1]
+                latest_bat_time = df_battery_history_1h.index[-1]
+                bat_val = f"{latest_bat:.2f} V"
+                bat_time_str = latest_bat_time.strftime('(%H:%M)')
             except Exception as e:
-                print(f"Error procesando live_stats de batería: {e}")
+                print(f"Error procesando df_battery_history_1h: {e}")
                 bat_val, bat_time_str = "Error", "(N/A)"
         
-        st.metric(label=f"🔋 Batería (Último Ping) {bat_time_str}", value=bat_val)
+        st.metric(label=f"🔋 Batería {bat_time_str}", value=bat_val)
 
-        # (v41) El mini-gráfico sigue usando el historial de 24h para contexto
-        if 'value' in df_battery_history_24h.columns and len(df_battery_history_24h['value']) > 1:
-            render_mini_chart(df_battery_history_24h['value'], "#2ECC71") # Verde
+        # (v43) El mini-gráfico ahora usa el historial de 1h
+        if 'value' in df_battery_history_1h.columns and len(df_battery_history_1h['value']) > 1:
+            render_mini_chart(df_battery_history_1h['value'], "#2ECC71") # Verde
         else:
-            st.caption("No hay historial de batería (24h).")
+            st.caption("No hay historial de batería (1h).")
 
 st.markdown("---") # Separador
 
@@ -875,6 +865,25 @@ with col2:
     # (v36) Los gráficos principales usan el historial de 24h
     df_display = render_history_charts(df_history_24h, "(Últimas 24h)")
     
+    # (v43) Añadir gráfico de tendencia de Batería 24h
+    st.markdown("<br>", unsafe_allow_html=True) # Pequeño espacio
+    if not df_battery_history_24h.empty and 'value' in df_battery_history_24h.columns:
+        fig_bat_24h = px.line(df_battery_history_24h, y='value', labels={'value': 'Voltaje'})
+        fig_bat_24h.update_layout(
+            title=f"Batería (Últimas 24h)",
+            template="plotly_dark", height=200,
+            xaxis_title="Hora (24h)", 
+            xaxis_tickformat='%H:%M',
+            yaxis_title="Voltaje V",
+            margin=dict(t=40, b=40, l=0, r=0),
+            hovermode="x unified"
+        )
+        st.plotly_chart(fig_bat_24h, use_container_width=True, config={'displayModeBar': False})
+    else:
+        st.info("No hay datos de batería disponibles (Últimas 24h).")
+
+
+    # (v43) Mover la IA al final
     if 'temperature' in df_display.columns:
         df_ai_input = df_display.dropna(subset=['temperature'])[['temperature']]
         
