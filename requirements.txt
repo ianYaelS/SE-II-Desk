@@ -1,0 +1,17 @@
+streamlit
+requests
+pandas
+numpy
+plotly
+folium
+streamlit-folium
+torch
+scipy
+matplotlib
+pytz
+flask
+python-dotenv
+pillow
+openpyxl
+scikit-learn
+streamlit-autorefresh
