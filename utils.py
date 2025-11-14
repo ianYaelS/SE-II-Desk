@@ -1,16 +1,19 @@
 # --------------------------------------------------------------------------
 # utils.py
 #
-# Lógica de Backend, Cliente de API de Samsara, IA y Servidor Webhook.
+# Lógica de Backend, Cliente de API de Samsara e IA.
 #
-# v37 (Solución Profesional de Historial vs. Snapshot)
-# - NUEVA FUNCIÓN: `get_vehicle_stats_history` para llamar a
-#   `fleet/vehicles/stats/history?types=gps,batteryMilliVolts,faultCodes`.
-#   Esto permite obtener la serie de tiempo de batería y fallas,
-#   en lugar de solo el snapshot.
-# - MANTENIDO (ESTABILIDAD): Se mantiene el `try/except OSError`
-#   en `run_flask_app` para evitar el crash de "Address already in use"
-#   en el puerto 5001.
+# v39 (Solución Profesional de Webhooks)
+# - ELIMINADO (CRÍTICO): Se eliminó TODO el código relacionado con
+#   Flask, threading, hmac, hashlib. Las funciones `run_flask_app`,
+#   `start_webhook_thread` y `handle_samsara_webhook` han sido
+#   borradas. Esto soluciona los errores 303 y "Address in use"
+#   en Streamlit Cloud.
+# - NUEVO: Se añadió una función simple `log_alert(alert_info)`
+#   que simplemente escribe en el archivo `webhook_log.jsonl`.
+#   Esta función es llamada por el nuevo motor de alertas en `app.py`.
+# - MANTENIDO (v37): Se mantiene la función `get_vehicle_stats_history`
+#   para obtener el historial de batería y fallas.
 # --------------------------------------------------------------------------
 
 import requests
@@ -24,28 +27,28 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 import pytz
-from flask import Flask, request, abort
-import threading
-import hmac
-import hashlib
 import json
 from dotenv import load_dotenv
+
+# (v39) Imports de Flask/threading eliminados
 
 # --- 1. CONFIGURACIÓN INICIAL Y VARIABLES DE ENTORNO ---
 
 load_dotenv()
 SAMSARA_API_KEY = os.getenv("SAMSARA_API_KEY")
-SAMSARA_WEBHOOK_SECRET = os.getenv("SAMSARA_WEBHOOK_SECRET")
+SAMSARA_WEBHOOK_SECRET = os.getenv("SAMSARA_WEBHOOK_SECRET") # (v39) Ya no se usa para hmac, pero se mantiene por si acaso
 
 if not SAMSARA_API_KEY:
     raise ValueError("La variable SAMSARA_API_KEY no está configurada en el archivo .env")
-if not SAMSARA_WEBHOOK_SECRET:
-    raise ValueError("La variable SAMSARA_WEBHOOK_SECRET no está configurada en el archivo .env")
+# (v39) El secret ya no es crítico para el funcionamiento
+# if not SAMSARA_WEBHOOK_SECRET:
+#     raise ValueError("La variable SAMSARA_WEBHOOK_SECRET no está configurada en el archivo .env")
 
 SAMSARA_API_URL = "https://api.samsara.com"
 MEXICO_TZ = pytz.timezone("America/Mexico_City") 
 WEBHOOK_LOG_FILE = "webhook_log.jsonl"
-WEBHOOK_PORT = 5000
+# (v39) Puerto de Webhook eliminado
+# WEBHOOK_PORT = 5001
 
 # --- 2. CLIENTE DE LA API DE SAMSARA ---
 
@@ -250,9 +253,9 @@ class SamsaraAPIClient:
         print("API-HIST-SENSORES: No se encontraron datos históricos.")
         return [], column_map
 
-    def get_vehicle_stats_history(self, vehicle_id, time_window_minutes, step_seconds):
-        """(v37 - NUEVO) (HISTORIAL) Obtiene historial de Batería, GPS y Fallas."""
-        print(f"API-HIST-VEHICULO: Obteniendo historial (últimos {time_window_minutes} min, step {step_seconds}s)...")
+    def get_vehicle_stats_history(self, vehicle_id, time_window_minutes):
+        """(v37) (HISTORIAL) Obtiene historial de Batería, GPS y Fallas."""
+        print(f"API-HIST-VEHICULO: Obteniendo historial (últimos {time_window_minutes} min)...")
         
         end_time_utc = datetime.now(pytz.utc)
         start_time_utc = end_time_utc - timedelta(minutes=time_window_minutes)
@@ -360,104 +363,18 @@ class AIModels:
             print(f"Error durante la predicción LSTM: {e}")
             return None, []
 
-# --- 4. SERVIDOR WEBHOOK (FLASK) ---
-flask_app = Flask(__name__)
+# --- 4. (v39) NUEVO REGISTRADOR DE ALERTAS ---
 
-@flask_app.route('/webhook', methods=['POST'])
-def handle_samsara_webhook():
-    print("¡Webhook recibido!")
-    signature = request.headers.get('X-Samsara-Signature')
-    if not signature:
-        print("Error de Webhook: Falta la cabecera X-Samsara-Signature.")
-        abort(400, "Falta la firma.")
+def log_alert(alert_info):
+    """
+    (v39) Reemplaza la lógica del webhook. Simplemente escribe
+    una alerta generada internamente en el archivo de registro.
+    """
     try:
-        sig_hash = signature.split('=')[-1]
-        expected_hash = hmac.new(
-            key=SAMSARA_WEBHOOK_SECRET.encode('utf-8'),
-            msg=request.data,
-            digestmod=hashlib.sha256
-        ).hexdigest()
-        if not hmac.compare_digest(sig_hash, expected_hash):
-            print("Error de Webhook: Firma no válida.")
-            abort(403, "Firma no válida.")
+        with open(WEBHOOK_LOG_FILE, "a") as f: # 'a' = append
+            f.write(json.dumps(alert_info) + "\n") # Escribir como JSON Line
+        print(f"Alerta Interna Registrada: {alert_info['message']}")
     except Exception as e:
-        print(f"Error al verificar la firma: {e}")
-        abort(500, "Error de verificación.")
+        print(f"Error al escribir en el archivo de registro de alertas: {e}")
 
-    print("Firma de Webhook verificada con éxito.")
-    
-    try:
-        data = request.json
-        alert_info = {}
-        
-        current_time_str = datetime.now(MEXICO_TZ).strftime('%Y-%m-%d %H:%M:%S')
-
-        if data.get('webhookType') == 'form':
-            form_data = data.get('data')
-            if form_data:
-                answer_value = form_data.get('formAnswer', {}).get('answerValue')
-                if answer_value:
-                    alert_info = {
-                        "type": f"Formulario: {form_data.get('form', {}).get('name', 'N/A')}",
-                        "driver_name": form_data.get('driver', {}).get('name', 'N/A'),
-                        "vehicle_name": form_data.get('vehicle', {}).get('name', 'N/A'),
-                        "message": f"{answer_value}",
-                        "timestamp": current_time_str
-                    }
-        
-        elif data.get('webhookType') == 'alert':
-             alert_data = data.get('data')
-             if alert_data:
-                 alert_type = alert_data.get('type', 'Alerta General')
-                 driver_name = alert_data.get('driver', {}).get('name', 'N/A')
-                 vehicle_name = alert_data.get('vehicle', {}).get('name', 'N/A')
-                 
-                 if vehicle_name == 'N/A' and alert_data.get('tags'):
-                     for tag in alert_data.get('tags', []):
-                         if tag.get('parentTagId') is None:
-                             vehicle_name = tag.get('name', 'N/A')
-                             break
-                             
-                 alert_info = {
-                        "type": f"{alert_type} ({alert_data.get('severity', 'info')})",
-                        "driver_name": driver_name,
-                        "vehicle_name": vehicle_name,
-                        "message": alert_data.get('description', 'Alerta sin descripción'),
-                        "timestamp": current_time_str
-                 }
-
-        if alert_info:
-            try:
-                with open(WEBHOOK_LOG_FILE, "a") as f:
-                    f.write(json.dumps(alert_info) + "\n")
-                print(f"Alerta de Webhook registrada: {alert_info}")
-            except Exception as e:
-                print(f"Error al escribir en el archivo de registro webhook: {e}")
-
-        return "OK", 200
-    except Exception as e:
-        print(f"Error al procesar el cuerpo del JSON del webhook: {e}")
-        abort(400, "JSON malformado.")
-
-def run_flask_app():
-    """(v36) Añadido try/except para OSError para manejar 'Address already in use'."""
-    try:
-        # (v37) Desactivar el logger de "Werkzeug" para una consola más limpia
-        import logging
-        log = logging.getLogger('werkzeug')
-        log.setLevel(logging.ERROR)
-        
-        flask_app.run(host='0.0.0.0', port=WEBHOOK_PORT)
-    except OSError as e:
-        if e.errno == 98 or e.errno == 48: # 98 (Linux) y 48 (macOS) son "Address already in use"
-            print(f"ADVERTENCIA: El puerto {WEBHOOK_PORT} ya está en uso. Es probable que otro hilo ya lo esté escuchando.")
-        else:
-            print(f"Error inesperado de OSError en el hilo de Flask: {e}")
-    except Exception as e:
-        print(f"Error inesperado en el hilo de Flask: {e}")
-
-def start_webhook_thread():
-    print("Iniciando hilo del servidor webhook...")
-    webhook_thread = threading.Thread(target=run_flask_app, daemon=True)
-    webhook_thread.start()
-    print(f"Hilo del servidor webhook iniciado. Escuchando en el puerto {WEBHOOK_PORT}.")
+# --- (v39) Lógica de Flask/Threading ELIMINADA ---
