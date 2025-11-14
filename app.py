@@ -3,21 +3,20 @@
 #
 # Aplicación Principal del Dashboard "Reefer-Tech" con Streamlit.
 #
-# v39 (Solución Profesional de Webhooks y KPIs)
-# - CORREGIDO (CRÍTICO - WEBHOOKS): Eliminada la dependencia de Flask/Threading.
-#   Se elimina la llamada a `start_webhook_thread`. Se añade
-#   `st.session_state.previous_live_stats` y una nueva función
-#   `check_and_log_alerts` que se ejecuta en cada ciclo y compara
-#   el estado de `checkEngineLightIsOn` para registrar alertas
-#   internamente. Esto soluciona los errores 303 y "Address in use".
-# - CORREGIDO (CRÍTICO - KPIs ATORADOS): Los KPIs de Temperatura, Humedad
-#   y Batería ahora toman su valor principal y timestamp desde el
-#   último punto (`.iloc[-1]`) de su respectivo dataframe de
-#   historial (`df_history_1h` o `df_battery_history_24h`),
-#   asegurando que siempre estén tan actualizados como sus gráficos.
-# - MEJORADO (UI PUERTA): `render_door_status` ahora busca el
-#   último evento *diferente* en el historial de 1h y lo muestra
-#   debajo del ping (ej. "Previo: Abierta a las 07:35:12").
+# v42 (Alertas Reales de API)
+# - ELIMINADO (CRÍTICO - ALERTAS): Eliminada toda la lógica de
+#   "simulación de webhooks" (check_and_log_alerts, previous_live_stats).
+#   Ya no escribimos en 'webhook_log.jsonl'.
+# - NUEVO (LÓGICA DE ALERTAS API):
+#   1. Se añade 'load_alert_configurations' para cachear todas las
+#      configuraciones de alertas de la organización.
+#   2. Se añade 'get_vehicle_config_ids' para filtrar "inteligentemente"
+#      las configuraciones que aplican al 'selected_vehicle_id'.
+#   3. Se añade 'fetch_alert_incidents' para pedir (cada 30s) los
+#      incidentes reales de las últimas 24h para ese vehículo.
+# - MEJORADO (UI ALERTAS): 'render_webhook_log' se renombra a
+#   'render_alert_log' y ahora parsea la respuesta de la API
+#   de '/alerts/incidents', mostrando las alertas reales de Samsara.
 # --------------------------------------------------------------------------
 
 import streamlit as st
@@ -30,8 +29,9 @@ from folium.features import DivIcon # <-- Ícono de pulso
 from streamlit_folium import st_folium
 import pytz
 from datetime import datetime, timedelta
-import json
-import os
+# (v42) json y os ya no son necesarios aquí
+# import json
+# import os
 
 # Importar nuestras utilidades de backend (API, IA, Webhook)
 import utils
@@ -59,11 +59,6 @@ try:
         st.session_state.api_client = utils.SamsaraAPIClient(api_key=utils.SAMSARA_API_KEY)
     if 'ai_model' not in st.session_state:
         st.session_state.ai_model = utils.AIModels()
-    
-    # (v39) Hilo de Webhook ELIMINADO
-    # if 'webhook_thread_started' not in st.session_state:
-    #     utils.start_webhook_thread()
-    #     st.session_state.webhook_thread_started = True
 
 except ValueError as e:
     st.error(f"Error de Configuración: {e}. Revisa tu archivo .env.")
@@ -80,11 +75,11 @@ if 'selected_vehicle_obj' not in st.session_state:
 if 'sensor_config' not in st.session_state:
     st.session_state.sensor_config = None
 if 'last_webhook_timestamp' not in st.session_state:
-    st.session_state.last_webhook_timestamp = None
+    st.session_state.last_webhook_timestamp = None # (v42) Se mantiene para el efecto "Nueva Alerta"
     
-# (v39) Estado para el nuevo motor de alertas
-if 'previous_live_stats' not in st.session_state:
-    st.session_state.previous_live_stats = None
+# (v42) Eliminado 'previous_live_stats'
+# if 'previous_live_stats' not in st.session_state:
+#     st.session_state.previous_live_stats = None
 
 
 # --- CSS v39 (Añadido .door-prev-event) ---
@@ -314,6 +309,49 @@ def process_vehicle_stats_history(stats_history_data):
         all_faults_list = vehicle_data['faultCodes'] # Esta es ahora una LISTA de objetos de falla
 
     return df_battery, all_faults_list
+
+# --- (v42) NUEVAS FUNCIONES DE CARGA DE ALERTAS API ---
+
+@st.cache_data(ttl=600) # Cachear configuraciones por 10 minutos
+def load_alert_configurations(_api_client):
+    """Carga todas las configuraciones de alertas de la organización."""
+    if not _api_client: return None
+    return _api_client.get_alert_configurations()
+
+@st.cache_data(ttl=REFRESH_INTERVAL_SEC)
+def fetch_alert_incidents(_api_client, configuration_ids, start_time_iso):
+    """Obtiene incidentes de alerta para IDs de configuración específicos."""
+    if not _api_client or not configuration_ids:
+        return None
+    return _api_client.get_alert_incidents(configuration_ids, start_time_iso)
+
+@st.cache_data
+def get_vehicle_config_ids(all_configs, vehicle_id):
+    """
+    Filtra la lista de todas las configuraciones de alertas para encontrar
+    aquellas que aplican a un ID de vehículo específico.
+    """
+    vehicle_config_ids = []
+    vehicle_id_str = str(vehicle_id) # Asegurar que sea string para comparar
+
+    if not all_configs or 'data' not in all_configs:
+        return []
+
+    for config in all_configs['data']:
+        target = config.get('target')
+        if not target:
+            continue
+            
+        # Comprobar si el ID del vehículo está en 'assetIds'
+        asset_ids = target.get('assetIds', [])
+        # Los IDs pueden ser int o str en la API, normalizamos a string
+        asset_ids_str = [str(aid) for aid in asset_ids]
+        
+        if vehicle_id_str in asset_ids_str:
+            vehicle_config_ids.append(config['id'])
+            
+    print(f"Encontradas {len(vehicle_config_ids)} configs de alerta para el vehículo {vehicle_id_str}: {vehicle_config_ids}")
+    return vehicle_config_ids
 
 
 # --- 4. FUNCIONES DE RENDERIZADO (CACHEADAS) ---
@@ -551,55 +589,52 @@ def render_history_charts(df, title_suffix):
     
     return df
 
-def render_webhook_log():
-    """(v39) Esta función no cambia. Sigue leyendo del archivo,
-    que ahora es poblado por `check_and_log_alerts`."""
-    st.subheader("🔔 Últimas Alertas del Activo")
-    log_file = utils.WEBHOOK_LOG_FILE
+def render_alert_log(incidents_data):
+    """(v42) Renderiza las alertas reales desde la respuesta API de /alerts/incidents."""
+    st.subheader("🔔 Alertas de Samsara (Últimas 24h)")
     
-    if not os.path.exists(log_file):
-        st.info("No se han recibido alertas del activo.")
+    if not incidents_data or 'data' not in incidents_data or not incidents_data['data']:
+        st.info("No se han registrado incidentes de alerta para este activo en las últimas 24h.")
         return
 
-    alerts = []
-    try:
-        with open(log_file, "r") as f:
-            lines = f.readlines()
-            for line in lines[-10:]:
-                if line.strip():
-                    alerts.append(json.loads(line))
-    except Exception as e:
-        st.error(f"Error al leer el registro de alertas: {e}")
-        return
-        
-    alerts.reverse()
+    # La API devuelve los más recientes primero, así que no necesitamos invertir
+    alerts = incidents_data['data'] 
     
-    if not alerts:
-        st.info("No se han recibido alertas del activo.")
-        return
+    # Notificación de "Nueva Alerta"
+    try:
+        last_alert_time = alerts[0]['startedAt']
+        if st.session_state.last_webhook_timestamp != last_alert_time:
+            st.success("🔔 Nueva Alerta de Activo!", icon="🔔")
+            st.session_state.last_webhook_timestamp = last_alert_time
+    except Exception:
+        pass # No fallar si no hay alertas
         
-    last_alert_time = alerts[0]['timestamp']
-    if st.session_state.last_webhook_timestamp != last_alert_time:
-        st.success("🔔 Nueva Alerta de Activo!", icon="🔔")
-        st.session_state.last_webhook_timestamp = last_alert_time
-        
-    for alert in alerts:
-        vehicle_name = alert.get('vehicle_name', 'N/A')
-        driver_name = alert.get('driver_name', '')
-        context = f"Vehículo: {vehicle_name}"
-        if driver_name and driver_name != 'N/A':
-            context += f" | Conductor: {driver_name}"
+    # Mostrar las últimas 10 alertas
+    for alert in alerts[:10]:
+        try:
+            alert_name = alert.get('name', 'Alerta Desconocida')
+            alert_time_utc = pd.to_datetime(alert.get('startedAt'))
+            alert_time_local = alert_time_utc.tz_convert(MEXICO_TZ).strftime('%Y-%m-%d %H:%M:%S')
             
-        st.markdown(f"""
-        <div class='webhook-alert'>
-            <div class='webhook-alert-header'>
-                <strong>{alert['type']}</strong>
-                <span style='float: right;'>{alert['timestamp']}</span>
+            # (v42) La descripción del incidente es más útil
+            message = alert.get('details', {}).get('description', 'Sin descripción.')
+            
+            # (v42) El 'target' es el vehículo
+            context = f"Activo: {alert.get('target', {}).get('name', 'N/A')}"
+            
+            st.markdown(f"""
+            <div class='webhook-alert'>
+                <div class='webhook-alert-header'>
+                    <strong>{alert_name}</strong>
+                    <span style='float: right;'>{alert_time_local}</span>
+                </div>
+                <div class='webhook-alert-message'>{message}</div>
+                <div class='webhook-alert-header' style='margin-top: 5px;'>{context}</div>
             </div>
-            <div class='webhook-alert-message'>{alert['message']}</div>
-            <div class='webhook-alert-header' style='margin-top: 5px;'>{context}</div>
-        </div>
-        """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
+        except Exception as e:
+            print(f"Error parseando incidente de alerta: {e}")
+            st.error(f"Error al mostrar una alerta: {e}")
 
 @st.cache_data(ttl=REFRESH_INTERVAL_SEC)
 def generate_map_data(live_stats, vehicle_name):
@@ -625,37 +660,9 @@ def get_ia_prediction(_ai_model, temperature_series, step_sec_ai):
         )
     return None, []
 
-# --- (v39) NUEVO MOTOR DE ALERTAS (Reemplaza Webhooks) ---
-def check_and_log_alerts(current_stats, previous_stats, vehicle_name):
-    """Compara el estado actual con el previo y registra alertas."""
-    if not previous_stats or not current_stats:
-        print("Motor de Alertas: Esperando al siguiente ciclo (no hay datos previos).")
-        return # No alertar en la primera ejecución
-
-    current_time_str = datetime.now(MEXICO_TZ).strftime('%Y-%m-%d %H:%M:%S')
-
-    # 1. Alerta de Check Engine Light
-    try:
-        current_cel = current_stats.get('faultCodes', {}).get('obdii', {}).get('checkEngineLightIsOn', False)
-        prev_cel = previous_stats.get('faultCodes', {}).get('obdii', {}).get('checkEngineLightIsOn', False)
-        
-        if current_cel and not prev_cel:
-            alert_info = {
-                "type": "Alerta de Motor",
-                "driver_name": "N/A",
-                "vehicle_name": vehicle_name,
-                "message": "Luz de Check Engine (MIL) se ha ENCENDIDO.",
-                "timestamp": current_time_str
-            }
-            utils.log_alert(alert_info)
-            print("ALERTA GENERADA: Check Engine Light ON")
-            
-    except Exception as e:
-        print(f"Error al procesar alerta de Check Engine: {e}")
-
-    # (Futuro) Aquí se pueden añadir más comprobaciones:
-    # Ej. if current_temp > 50 and prev_temp <= 50: ...
-    # Ej. if current_door == 'ABIERTA' for > 10 min: ...
+# --- (v42) MOTOR DE ALERTAS INTERNAS ELIMINADO ---
+# def check_and_log_alerts(current_stats, previous_stats, vehicle_name):
+#     ...
 
 
 # --- 5. INICIALIZACIÓN DE LA APP ---
@@ -678,8 +685,8 @@ def on_vehicle_change():
         st.session_state.sensor_config = None
     # Limpiar caché de datos
     st.cache_data.clear()
-    # (v39) Reiniciar el estado de alertas
-    st.session_state.previous_live_stats = None
+    # (v42) Eliminado 'previous_live_stats'
+    # st.session_state.previous_live_stats = None
 
 
 if st.session_state.selected_vehicle_name is None and vehicle_names:
@@ -732,9 +739,26 @@ raw_stats_history = fetch_vehicle_stats_history(
 )
 df_battery_history_24h, all_fault_codes_list = process_vehicle_stats_history(raw_stats_history)
 
-# --- (v39) EJECUTAR MOTOR DE ALERTAS ---
-check_and_log_alerts(live_stats, st.session_state.previous_live_stats, selected_vehicle_name)
-st.session_state.previous_live_stats = live_stats # Guardar estado actual para el próximo ciclo
+# 5. (v42) NUEVA CARGA DE ALERTAS REALES
+# 5.1 Cargar todas las configuraciones (cacheado)
+all_alert_configs = load_alert_configurations(st.session_state.api_client)
+
+# 5.2 Filtrar IDs de config para este vehículo (cacheado)
+vehicle_config_ids = get_vehicle_config_ids(all_alert_configs, selected_vehicle_id)
+
+# 5.3 Definir ventana de tiempo (últimas 24h)
+start_time_alerts = datetime.now(pytz.utc) - timedelta(hours=24)
+
+# 5.4 Pedir incidentes (cacheado por 30s)
+alert_incidents = fetch_alert_incidents(
+    st.session_state.api_client, 
+    vehicle_config_ids, 
+    start_time_alerts.isoformat()
+)
+
+
+# --- (v42) MOTOR DE ALERTAS INTERNAS ELIMINADO ---
+# check_and_log_alerts(...)
 
 
 # --- 8. RENDERIZADO DE LA BARRA LATERAL ---
@@ -790,17 +814,22 @@ with kpi_col3:
             
 with kpi_col4:
     with st.container(border=True, height=185):
-        # (v39) KPI de Batería basado en el historial de 24h
+        # (v41) Solución Híbrida para KPI de Batería
         bat_val, bat_time_str = "N/A", "(N/A)"
-        if not df_battery_history_24h.empty and 'value' in df_battery_history_24h.columns:
-            latest_bat = df_battery_history_24h['value'].iloc[-1]
-            latest_bat_time = df_battery_history_24h.index[-1]
-            bat_val = f"{latest_bat:.2f} V"
-            bat_time_str = latest_bat_time.strftime('(%H:%M)')
+        if live_stats and live_stats.get('batteryMilliVolts'):
+            try:
+                latest_bat_mv = live_stats['batteryMilliVolts']
+                bat_val = f"{float(latest_bat_mv['value']) / 1000.0:.2f} V"
+                # El timestamp ya es tz-aware (UTC), convertir a local
+                bat_time = pd.to_datetime(latest_bat_mv['time']).tz_convert(MEXICO_TZ)
+                bat_time_str = bat_time.strftime('(%H:%M)')
+            except Exception as e:
+                print(f"Error procesando live_stats de batería: {e}")
+                bat_val, bat_time_str = "Error", "(N/A)"
         
-        st.metric(label=f"🔋 Batería {bat_time_str}", value=bat_val)
+        st.metric(label=f"🔋 Batería (Último Ping) {bat_time_str}", value=bat_val)
 
-        # (v37) Renderizar mini-gráfico desde el historial de 24h
+        # (v41) El mini-gráfico sigue usando el historial de 24h para contexto
         if 'value' in df_battery_history_24h.columns and len(df_battery_history_24h['value']) > 1:
             render_mini_chart(df_battery_history_24h['value'], "#2ECC71") # Verde
         else:
@@ -832,9 +861,9 @@ with col1:
     
     st_folium(m, width=None, height=500, use_container_width=True, returned_objects=[])
     
-    # --- LOG DE WEBHOOKS (AHORA POBLADO POR EL MOTOR DE ALERTAS) ---
+    # --- (v42) LOG DE ALERTAS REALES DE API ---
     st.markdown("---")
-    render_webhook_log() 
+    render_alert_log(alert_incidents) 
 
 with col2:
     # --- GRÁFICOS DE 24H (Cacheados) ---
